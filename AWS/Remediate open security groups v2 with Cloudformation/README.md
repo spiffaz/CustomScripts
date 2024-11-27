@@ -26,55 +26,58 @@ The solution consists of:
 - Python 3.x
 - boto3 AWS SDK
 
-## Deployment
+## Deployment Options
 
-### Initial Deployment
+### As a Standalone Stack
 
-Deploy the CloudFormation stack using the AWS CLI:
-
+Deploy using AWS CLI:
 ```bash
 aws cloudformation create-stack \
   --stack-name security-group-remediation \
   --template-body file://template.yaml \
   --capabilities CAPABILITY_IAM \
-  --parameters ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/16,172.16.0.0/12,192.168.0.0/16"
+  --parameters \
+    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/16,172.16.0.0/12,192.168.0.0/16" \
+    ParameterKey=IsStackSetExecution,ParameterValue=false
 ```
 
-Or using the AWS Console:
-1. Navigate to CloudFormation
-2. Choose "Create stack"
-3. Upload the template.yaml file
-4. Fill in the parameters:
-   - Stack name: `security-group-remediation`
-   - InternalCIDRRanges: Comma-separated list of CIDR ranges
+### As a StackSet
 
-### Updating CIDR Ranges
-
-To update the CIDR ranges, update the stack with new parameters:
-
+Deploy using AWS CLI:
 ```bash
-aws cloudformation update-stack \
-  --stack-name security-group-remediation \
+aws cloudformation create-stack-set \
+  --stack-set-name security-group-remediation \
   --template-body file://template.yaml \
   --capabilities CAPABILITY_IAM \
-  --parameters ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12"
+  --parameters \
+    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/16,172.16.0.0/12,192.168.0.0/16" \
+    ParameterKey=IsStackSetExecution,ParameterValue=true
+```
+
+Then create stack instances:
+```bash
+aws cloudformation create-stack-instances \
+  --stack-set-name security-group-remediation \
+  --accounts "111111111111" "222222222222" \
+  --regions "eu-west-1" "us-east-1"
 ```
 
 ## Configuration
 
 ### CloudFormation Parameters
 
-| Parameter | Description | Default | Example |
-|-----------|-------------|---------|---------|
-| InternalCIDRRanges | Comma-separated list of internal CIDR ranges | 10.0.0.0/16,10.1.0.0/16 | 10.0.0.0/8,172.16.0.0/12 |
+| Parameter | Description | Default | Required |
+|-----------|-------------|---------|----------|
+| InternalCIDRRanges | Comma-separated list of internal CIDR ranges | 10.0.0.0/16,10.1.0.0/16 | Yes |
+| IsStackSetExecution | Indicates if deployment is via StackSet | false | Yes |
 
-### Environment Variables
+### Resource Tags
 
-The Lambda function uses the following environment variables:
-
-| Variable | Description | Source |
-|----------|-------------|--------|
-| INTERNAL_CIDR_RANGES | Comma-separated list of CIDR ranges | CloudFormation parameter |
+The following tags are automatically applied to supported resources:
+- CreatedBy: Stack name
+- StackId: Full stack ID
+- StackSetName: Name of the StackSet (if applicable, "N/A" if not)
+- CreatedMethod: CloudFormation
 
 ## Triggering Events
 
@@ -82,28 +85,26 @@ The function automatically responds to the following EC2 API calls:
 - CreateSecurityGroup
 - AuthorizeSecurityGroupIngress
 - ModifySecurityGroupRules
+- UpdateSecurityGroupRuleDescriptionsIngress
+- RevokeSecurityGroupIngress
 
-## Response Format
+## Monitoring and Logs
 
-The function returns a JSON object with:
-- `statusCode`: HTTP status code (200 for success, 400/500 for errors)
-- `body`: Description of the action taken or error message
+### CloudWatch Logs
+The Lambda function logs the following information:
+- Received events
+- CIDR range configurations
+- Security group modifications
+- Remediation actions
+- Error messages
 
-### Success Response Example
-```json
-{
-    "statusCode": 200,
-    "body": "Ingress rules for security group sg-xxxxxxxxxxxxxxxxx have been remediated."
-}
-```
-
-### Error Response Example
-```json
-{
-    "statusCode": 400,
-    "body": "Error processing event: Could not determine security group ID from event"
-}
-```
+### Lambda Metrics
+Monitor the following CloudWatch metrics:
+- Invocations
+- Errors
+- Duration
+- Throttles
+- ConcurrentExecutions
 
 ## Error Handling
 
@@ -112,77 +113,82 @@ The function includes error handling for:
 - Missing security group ID
 - Invalid security group ID
 - Invalid CIDR range format
-- Permissions issues
 - AWS API errors
-
-## Logging
-
-The function logs detailed information about:
-- Received EventBridge events
-- Configured CIDR ranges
-- Security group evaluation
-- Rule modifications
-- Error conditions
-- Remediation actions
-
-## Best Practices
-
-1. Test the function in a non-production environment first
-2. Review and update the internal CIDR ranges regularly
-3. Monitor the Lambda execution logs for any issues
-4. Consider implementing additional validation for security group modifications
-5. Use AWS Organizations SCPs to restrict modifications to the Lambda function and EventBridge rule
 
 ## Security Considerations
 
-- Ensure the Lambda execution role follows the principle of least privilege
-- Regularly audit the internal CIDR ranges being used
-- Consider implementing additional controls for sensitive security groups
-- Monitor CloudTrail logs for security group modifications
-- Implement proper change management for CIDR range updates
+1. IAM Role Permissions
+   - Lambda execution role has minimal required permissions
+   - Only allows specific EC2 security group actions
+
+2. Network Security
+   - Function replaces 0.0.0.0/0 with specified internal ranges
+   - Original port and protocol settings are preserved
 
 ## Limitations
 
-- The function only remediates IPv4 CIDR-based rules
-- Only processes ingress rules (not egress)
-- Does not handle security group references or IPv6 rules
-- Maximum of 100 comma-separated CIDR ranges due to Lambda environment variable size limits
-
-## Monitoring and Maintenance
-
-1. Monitor Lambda function metrics in CloudWatch
-   - Invocation count
-   - Error count
-   - Duration
-   - Memory usage
-
-2. Review CloudWatch Logs for:
-   - Function execution details
-   - CIDR range configuration
-   - Remediation actions
-   - Error messages
-
-3. Regular maintenance tasks:
-   - Review and update CIDR ranges as network architecture changes
-   - Verify EventBridge rule is properly triggering
-   - Check IAM roles and permissions
-   - Review CloudTrail logs for security group modifications
+- Only processes IPv4 CIDR-based rules
+- Only handles ingress rules
+- Does not process security group references
+- Does not handle IPv6 rules
 
 ## Troubleshooting
 
-Common issues and solutions:
+### Common Issues
 
-1. Lambda not triggering:
-   - Check EventBridge rule configuration
-   - Verify CloudTrail is enabled
-   - Check IAM permissions
+1. Lambda Not Triggering
+   - Verify EventBridge rule is active
+   - Check CloudTrail is enabled
+   - Review IAM permissions
 
-2. CIDR range updates not taking effect:
-   - Verify CloudFormation stack update completed successfully
-   - Check Lambda environment variables
-   - Review Lambda function logs
+2. Rule Modification Failures
+   - Verify security group exists
+   - Check CIDR ranges are valid
+   - Review Lambda execution role permissions
 
-3. Remediation failures:
-   - Check security group exists
-   - Verify IAM permissions
-   - Review error messages in CloudWatch Logs
+3. StackSet Deployment Issues
+   - Ensure target accounts have required StackSet execution role
+   - Verify region is supported
+   - Check account limits
+
+### Logs Analysis
+
+To analyze issues:
+1. Open CloudWatch Logs
+2. Find the log group for the Lambda function
+3. Look for ERROR level messages
+4. Check event processing details
+
+## Maintenance
+
+Regular maintenance tasks:
+1. Review and update CIDR ranges as needed
+2. Monitor CloudWatch logs for errors
+3. Check CloudTrail for security group modifications
+4. Verify EventBridge rule is functioning
+5. Review IAM roles and permissions
+
+## Updating the Stack
+
+To update CIDR ranges or other parameters:
+
+```bash
+aws cloudformation update-stack \
+  --stack-name security-group-remediation \
+  --template-body file://template.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters \
+    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12" \
+    ParameterKey=IsStackSetExecution,ParameterValue=false
+```
+
+For StackSets:
+```bash
+aws cloudformation update-stack-set \
+  --stack-set-name security-group-remediation \
+  --template-body file://template.yaml \
+  --capabilities CAPABILITY_IAM \
+  --parameters \
+    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12" \
+    ParameterKey=IsStackSetExecution,ParameterValue=true
+```
