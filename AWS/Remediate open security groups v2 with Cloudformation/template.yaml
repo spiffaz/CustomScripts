@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to deploy Security Group remediation Lambda with EventBridge trigger'
+
+Parameters:
+  InternalCIDRRanges:
+    Type: String
+    Description: 'Comma-separated list of internal CIDR ranges (e.g., "10.0.0.0/16,10.1.0.0/16")'
+    Default: '10.0.0.0/16,10.1.0.0/16'
+  IsStackSetExecution:
+    Type: String
+    Description: 'Is this template being deployed via StackSet'
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+Conditions:
+  IsStackSet: !Equals [!Ref IsStackSetExecution, 'true'] 
+
+Mappings:
+  DefaultTags:
+    Tags:
+      CreatedMethod: "CloudFormation"
+
+Resources:
+  SecurityGroupRemediationLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: security-group-remediation
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import os
+
+          # Initialize EC2 client
+          ec2 = boto3.client('ec2')
+
+          def get_internal_cidr_ranges():
+              """Get internal CIDR ranges from environment variable"""
+              cidr_ranges_str = os.environ.get('INTERNAL_CIDR_RANGES', '10.0.0.0/16')
+              return [cidr.strip() for cidr in cidr_ranges_str.split(',')]
+
+          def lambda_handler(event, context):
+              # Print the received event for logging
+              print(f"Received event: {json.dumps(event)}")
+
+              # Get CIDR ranges from environment variable
+              internal_cidr_ranges = get_internal_cidr_ranges()
+              print(f"Using internal CIDR ranges: {internal_cidr_ranges}")
+
+              # Extract security group ID from the CloudTrail event
+              try:
+                  if 'detail' in event:
+                      # This is an EventBridge event
+                      event_name = event['detail']['eventName']
+                      print(f"Processing event: {event_name}")
+
+                      if event_name == 'CreateSecurityGroup':
+                          # For CreateSecurityGroup events, get the newly created security group ID
+                          target_sg_id = event['detail']['responseElements']['groupId']
+                      elif event_name == 'ModifySecurityGroupRules':
+                          # For ModifySecurityGroupRules, the group ID is nested differently
+                          target_sg_id = event['detail']['requestParameters']['ModifySecurityGroupRulesRequest']['GroupId']
+                      elif 'groupId' in event['detail']['requestParameters']:
+                          target_sg_id = event['detail']['requestParameters']['groupId']
+                      else:
+                          # Try to find security group ID in different locations
+                          request_params = event['detail']['requestParameters']
+                          if 'groupName' in request_params:
+                              # If we have the group name, we can describe security groups to get the ID
+                              groups = ec2.describe_security_groups(
+                                  Filters=[{'Name': 'group-name', 'Values': [request_params['groupName']]}]
+                              )
+                              if groups['SecurityGroups']:
+                                  target_sg_id = groups['SecurityGroups'][0]['GroupId']
+                              else:
+                                  raise ValueError("Could not find security group with specified name")
+                          else:
+                              raise ValueError("Could not determine security group ID from event")
+                  else:
+                      # For direct Lambda invocation (backwards compatibility)
+                      target_sg_id = event.get('target_sg_id')
+
+                  if not target_sg_id:
+                      raise ValueError("Could not determine security group ID from event")
+
+              except Exception as e:
+                  print(f"Error extracting security group ID from event: {str(e)}")
+                  return {
+                      'statusCode': 400,
+                      'body': f"Error processing event: {str(e)}"
+                  }
+
+              print(f"Target Security Group ID: {target_sg_id}")
+
+              # Add a small delay to allow for eventual consistency
+              import time
+              time.sleep(2)
+
+              # Describe the specific security group
+              try:
+                  security_group = ec2.describe_security_groups(GroupIds=[target_sg_id])
+                  print(f"Successfully described security group {target_sg_id}.")
+              except Exception as e:
+                  print(f"Error describing security group: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': f"Error describing security group: {str(e)}"
+                  }
+
+              # Flag to check if any rules were remediated
+              remediation_done = False
+
+              # Iterate through the permissions (rules) of the security group
+              for permission in security_group['SecurityGroups'][0]['IpPermissions']:
+                  print(f"Evaluating rule with protocol {permission['IpProtocol']}, "
+                        f"ports {permission.get('FromPort', 'All')} to {permission.get('ToPort', 'All')}.")
+
+                  # Check the IP ranges for open ingress (0.0.0.0/0)
+                  for ip_range in permission.get('IpRanges', []):
+                      if ip_range['CidrIp'] == '0.0.0.0/0':
+                          print(f"Found rule allowing ingress from 0.0.0.0/0 on ports "
+                                f"{permission.get('FromPort', 'All')} to {permission.get('ToPort', 'All')}.")
+
+                          try:
+                              # Revoke the open ingress rule
+                              ec2.revoke_security_group_ingress(
+                                  GroupId=target_sg_id,
+                                  IpProtocol=permission['IpProtocol'],
+                                  FromPort=permission.get('FromPort'),
+                                  ToPort=permission.get('ToPort'),
+                                  CidrIp='0.0.0.0/0'
+                              )
+                              print(f"Revoked rule allowing ingress from 0.0.0.0/0 on ports "
+                                    f"{permission.get('FromPort')} to {permission.get('ToPort')}.")
+
+                              # Authorize new rules for each internal CIDR range
+                              for cidr in internal_cidr_ranges:
+                                  ec2.authorize_security_group_ingress(
+                                      GroupId=target_sg_id,
+                                      IpProtocol=permission['IpProtocol'],
+                                      FromPort=permission.get('FromPort'),
+                                      ToPort=permission.get('ToPort'),
+                                      CidrIp=cidr
+                                  )
+                                  print(f"Authorized rule allowing ingress from {cidr} on ports "
+                                        f"{permission.get('FromPort')} to {permission.get('ToPort')}.")
+
+                              remediation_done = True
+
+                          except Exception as e:
+                              print(f"Error modifying security group: {str(e)}")
+                              return {
+                                  'statusCode': 500,
+                                  'body': f"Error modifying security group: {str(e)}"
+                              }
+
+              if not remediation_done:
+                  print(f"No open ingress rules found for security group {target_sg_id}. No remediation was necessary.")
+                  return {
+                      'statusCode': 200,
+                      'body': f"No remediation necessary for security group {target_sg_id}. No open ingress rules were found."
+                  }
+
+              print(f"Ingress rules for security group {target_sg_id} have been remediated.")
+              return {
+                  'statusCode': 200,
+                  'body': f"Ingress rules for security group {target_sg_id} have been remediated."
+              }
+      Environment:
+        Variables:
+          INTERNAL_CIDR_RANGES: !Ref InternalCIDRRanges
+      Timeout: 30
+      MemorySize: 128
+      Tags:
+        - Key: CreatedBy
+          Value: !Ref 'AWS::StackName'
+        - Key: StackId
+          Value: !Ref 'AWS::StackId'
+        - Key: StackSetName
+          Value: !If [IsStackSet, !Select [0, !Split ["-", !Ref 'AWS::StackName']], "N/A"]
+        - Key: CreatedMethod
+          Value: !FindInMap [DefaultTags, Tags, CreatedMethod]
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityGroupManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSecurityGroups
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupIngress
+                Resource: '*'
+      Tags:
+        - Key: CreatedBy
+          Value: !Ref 'AWS::StackName'
+        - Key: StackId
+          Value: !Ref 'AWS::StackId'
+        - Key: StackSetName
+          Value: !If [IsStackSet, !Select [0, !Split ["-", !Ref 'AWS::StackName']], "N/A"]
+        - Key: CreatedMethod
+          Value: !FindInMap [DefaultTags, Tags, CreatedMethod]
+
+  SecurityGroupEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: security-group-changes
+      Description: 'Capture all Security Group modifications and creations'
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - ec2.amazonaws.com
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - CreateSecurityGroup
+            - ModifySecurityGroupRules
+            - UpdateSecurityGroupRuleDescriptionsIngress
+            - RevokeSecurityGroupIngress
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecurityGroupRemediationLambda.Arn
+          Id: SecurityGroupRemediationTarget
+
+  LambdaInvokePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !Ref SecurityGroupRemediationLambda
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityGroupEventRule.Arn
+
+Outputs:
+  LambdaArn:
+    Description: 'ARN of the created Lambda function'
+    Value: !GetAtt SecurityGroupRemediationLambda.Arn
+  EventRuleArn:
+    Description: 'ARN of the created EventBridge rule'
+    Value: !GetAtt SecurityGroupEventRule.Arn
+  ConfiguredCIDRRanges:
+    Description: 'Configured internal CIDR ranges'
+    Value: !Ref InternalCIDRRanges
