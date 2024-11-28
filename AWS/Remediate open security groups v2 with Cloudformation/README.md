@@ -1,37 +1,64 @@
-# AWS Security Group Remediation Lambda
+# AWS Security Group Remediation Solution
 
-This Lambda function automatically remediates open ingress rules (0.0.0.0/0) in AWS Security Groups by replacing them with specified internal CIDR ranges. It is triggered automatically when security groups are created or modified.
+This solution provides automated remediation of open ingress rules (0.0.0.0/0) in AWS Security Groups. It deploys a serverless infrastructure that monitors and automatically modifies security groups to maintain security compliance by replacing open CIDR ranges with specified internal ranges.
 
-## Features
+## Solution Overview
 
-- Automatically triggered by security group changes through EventBridge
-- Configurable internal CIDR ranges via CloudFormation parameters
-- Identifies and removes ingress rules that allow access from 0.0.0.0/0
-- Replaces open rules with specified internal CIDR ranges
-- Preserves original protocol and port configurations
-- Skips remediation for specified ports on security groups attached to load balancers
-- Provides detailed logging for troubleshooting
+The CloudFormation template deploys a complete security group remediation solution that consists of:
 
-## Architecture
+1. **EventBridge Rule** - Monitors the following security group-related events:
+   - CreateSecurityGroup
+   - AuthorizeSecurityGroupIngress
+   - ModifySecurityGroupRules
 
-The solution consists of:
-1. An EventBridge rule that monitors for security group changes
-2. A Lambda function that performs the remediation
-3. IAM roles and permissions for secure execution
-4. Environment variables for CIDR range and port configuration
+2. **Lambda Function** - Performs the automated remediation of security groups
 
-## Prerequisites
+3. **IAM Role** - Provides necessary permissions for the Lambda function to:
+   - Read security group configurations
+   - Modify security group rules
+   - Check load balancer associations
+   - Write logs to CloudWatch
 
-- AWS CLI installed and configured
-- Appropriate permissions to deploy CloudFormation templates
-- Python 3.x
-- boto3 AWS SDK
+### Key Features
+
+- Automatically detects and remediates open security group rules
+- Special handling for load balancer security groups
+- Configurable internal CIDR ranges for rule replacement
+- Configurable port exceptions for load balancers
+- Comprehensive logging and monitoring
+- Support for both standalone and multi-account deployments via StackSets
+
+### CloudFormation Template Structure
+
+#### Parameters
+- `InternalCIDRRanges` - Defines the internal CIDR ranges that will replace 0.0.0.0/0 rules
+- `IsStackSetExecution` - Controls StackSet-specific configurations
+- `AdditionalSkipPorts` - Specifies ports to exclude from remediation on load balancer security groups
+
+#### Resources
+1. **SecurityGroupRemediationLambda**
+   - Python 3.9 runtime
+   - 30-second timeout
+   - 128MB memory allocation
+   - Environment variables for configuration
+
+2. **LambdaExecutionRole**
+   - Basic Lambda execution permissions
+   - Security group management permissions
+   - Load balancer describibility permissions
+
+3. **SecurityGroupEventRule**
+   - EventBridge rule configuration
+   - CloudTrail API event pattern matching
+   - Lambda target specification
+
+4. **LambdaInvokePermission**
+   - Allows EventBridge to invoke the Lambda function
 
 ## Deployment Options
 
-### As a Standalone Stack
+### Standalone Deployment
 
-Deploy using AWS CLI:
 ```bash
 aws cloudformation create-stack \
   --stack-name security-group-remediation \
@@ -43,9 +70,9 @@ aws cloudformation create-stack \
     ParameterKey=AdditionalSkipPorts,ParameterValue="22,3389"
 ```
 
-### As a StackSet
+### Multi-Account Deployment (StackSet)
 
-Deploy using AWS CLI:
+1. Create the StackSet:
 ```bash
 aws cloudformation create-stack-set \
   --stack-set-name security-group-remediation \
@@ -57,7 +84,7 @@ aws cloudformation create-stack-set \
     ParameterKey=AdditionalSkipPorts,ParameterValue="22,3389"
 ```
 
-Then create stack instances:
+2. Deploy to accounts:
 ```bash
 aws cloudformation create-stack-instances \
   --stack-set-name security-group-remediation \
@@ -65,116 +92,102 @@ aws cloudformation create-stack-instances \
   --regions "eu-west-1" "us-east-1"
 ```
 
-## Configuration
+## Lambda Function Implementation Details
 
-### CloudFormation Parameters
+The Lambda function serves as the core remediation engine. Here's how it works:
 
-| Parameter | Description | Default | Required |
-|-----------|-------------|---------|----------|
-| InternalCIDRRanges | Comma-separated list of internal CIDR ranges | 10.0.0.0/16,10.1.0.0/16 | Yes |
-| IsStackSetExecution | Indicates if deployment is via StackSet | false | Yes |
-| AdditionalSkipPorts | Comma-separated list of additional ports to skip remediation for load balancer security groups | None | No |
+### Event Processing Flow
 
-### Resource Tags
+1. **Event Reception**
+   - Receives CloudTrail events for security group changes
+   - Extracts security group ID from the event
+   - Validates event structure and required information
 
-The following tags are automatically applied to supported resources:
-- CreatedBy: Stack name
-- StackId: Full stack ID
-- StackSetName: Name of the StackSet (if applicable, "N/A" if not)
-- CreatedMethod: CloudFormation
+2. **Security Group Classification**
+   - Checks if the security group is attached to a load balancer
+   - Determines appropriate remediation strategy based on classification
 
-## Triggering Events
+3. **Rule Evaluation**
+   - Identifies rules with 0.0.0.0/0 CIDR
+   - Processes different rule types:
+     - All protocols (-1)
+     - Specific protocols with ports
+     - Port ranges
+     - Individual ports
 
-The function automatically responds to the following EC2 API calls:
-- CreateSecurityGroup
-- AuthorizeSecurityGroupIngress  
-- ModifySecurityGroupRules
+4. **Remediation Actions**
+   - For load balancer security groups:
+     - Preserves allowed ports (80, 443, and configured exceptions)
+     - Removes other open rules
+   - For regular security groups:
+     - Removes open rules
+     - Creates new rules with internal CIDR ranges
+     - Preserves original protocol and port configurations
 
-## Monitoring and Logs
+### Load Balancer Security Group Handling
+
+The function provides special handling for load balancer security groups:
+
+- Automatically detects ELB/ALB/NLB associations
+- Allows HTTP (80) and HTTPS (443) from 0.0.0.0/0 by default
+- Supports additional allowed ports via configuration
+- Removes non-allowed open rules without replacement
+- Preserves allowed port configurations
+
+### Error Handling and Logging
+
+The function implements comprehensive error handling:
+
+- Prevents remediation loops
+- Handles AWS API errors
+- Provides detailed logging
+- Returns appropriate status codes:
+  - 200: Success
+  - 207: Partial success
+  - 400: Invalid input
+  - 500: AWS API errors
+
+## Monitoring and Operations
 
 ### CloudWatch Logs
-The Lambda function logs the following information:  
-- Received events
-- CIDR range and port configurations
-- Load balancer association checks
+
+The solution provides detailed logging of:
+- Event processing
 - Security group modifications
-- Remediation actions  
-- Error messages
+- Rule evaluations
+- Error conditions
+- Remediation actions
 
-### Lambda Metrics
-Monitor the following CloudWatch metrics:
-- Invocations
-- Errors
+### Metrics to Monitor
+
+- Lambda invocations
+- Error rates
 - Duration
-- Throttles
-- ConcurrentExecutions
-
-## Error Handling
-
-The function includes error handling for:
-- Invalid or missing event data
-- Missing security group ID 
-- Invalid security group ID
-- Invalid CIDR range or port format
-- AWS API errors
-
-## Security Considerations
-
-1. IAM Role Permissions
-   - Lambda execution role has minimal required permissions  
-   - Only allows specific EC2, ELB, and ALB actions
-
-2. Network Security
-   - Function replaces 0.0.0.0/0 with specified internal ranges
-   - Original port and protocol settings are preserved
-   - Skips remediation for specified ports on load balancer security groups
+- Throttling events
+- Concurrent executions
 
 ## Limitations
 
-- Only processes IPv4 CIDR-based rules
-- Only handles ingress rules
-- Does not process security group references  
-- Does not handle IPv6 rules
-
-## Troubleshooting 
-
-### Common Issues
-
-1. Lambda Not Triggering
-   - Verify EventBridge rule is active
-   - Check CloudTrail is enabled  
-   - Review IAM permissions
-
-2. Rule Modification Failures  
-   - Verify security group exists
-   - Check CIDR ranges and ports are valid
-   - Review Lambda execution role permissions
-
-3. StackSet Deployment Issues
-   - Ensure target accounts have required StackSet execution role
-   - Verify region is supported
-   - Check account limits   
-
-### Logs Analysis
-
-To analyze issues:
-1. Open CloudWatch Logs
-2. Find the log group for the Lambda function  
-3. Look for ERROR level messages
-4. Check event processing details
+- IPv4 CIDR rules only
+- Ingress rules only
+- No security group reference processing
+- No IPv6 support
+- AWS limit of 60 rules per security group
+- 30-second Lambda timeout
 
 ## Maintenance
 
-Regular maintenance tasks:
-1. Review and update CIDR ranges and skip ports as needed
-2. Monitor CloudWatch logs for errors
-3. Check CloudTrail for security group modifications
-4. Verify EventBridge rule is functioning
-5. Review IAM roles and permissions
+### Regular Tasks
 
-## Updating the Stack
+1. Review and update CIDR ranges as needed
+2. Update skip ports configuration
+3. Monitor CloudWatch logs
+4. Review IAM permissions
+5. Verify EventBridge rule status
 
-To update CIDR ranges, skip ports or other parameters:
+### Configuration Updates
+
+Update existing deployment:
 
 ```bash
 aws cloudformation update-stack \
@@ -182,17 +195,17 @@ aws cloudformation update-stack \
   --template-body file://template.yaml \
   --capabilities CAPABILITY_IAM \
   --parameters \
-    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12" \  
+    ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12" \
     ParameterKey=IsStackSetExecution,ParameterValue=false \
-    ParameterKey=AdditionalSkipPorts,ParameterValue="22,3389,8080"  
+    ParameterKey=AdditionalSkipPorts,ParameterValue="22,3389,8080"
 ```
 
-For StackSets:
-```bash 
+Update StackSet:
+```bash
 aws cloudformation update-stack-set \
   --stack-set-name security-group-remediation \
   --template-body file://template.yaml \
-  --capabilities CAPABILITY_IAM \   
+  --capabilities CAPABILITY_IAM \
   --parameters \
     ParameterKey=InternalCIDRRanges,ParameterValue="10.0.0.0/8,172.16.0.0/12" \
     ParameterKey=IsStackSetExecution,ParameterValue=true \
