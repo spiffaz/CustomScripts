@@ -1,6 +1,7 @@
 # AWS Security Group Remediation Lambda
 
 This Lambda function automatically remediates open ingress rules (0.0.0.0/0) in AWS Security Groups by replacing them with specified internal CIDR ranges. This helps maintain security best practices by preventing unrestricted access to AWS resources.
+This does not remediate already existing rules, the lambda is triggered when a new rule is created or when there is a change in security group rules.
 
 ## Features
 
